@@ -378,7 +378,7 @@ def build_output(processes, sessions_info, locked_sessions, results, term_width,
     info_w = max_w - pad - 2  # available width for info text
 
     buf.append("")
-    title = f"  {BOLD}{WHITE}Claude Code Monitor{RESET}  {DIM}{n} instance{'s' if n != 1 else ''}{RESET}  {DIM}{now_str}{RESET}"
+    title = f"  {BOLD}{WHITE}Claude Monitor{RESET}  {DIM}{n} instance{'s' if n != 1 else ''}{RESET}  {DIM}{now_str}{RESET}"
     buf.append(title)
 
     # Plan & usage bars (above instances)
@@ -530,6 +530,7 @@ def fetch_rate_limits(access_token):
         _usage_cache["time"] = now
         return result
 
+    headers = None
     try:
         body = json.dumps({
             "model": "claude-3-5-haiku-latest",
@@ -556,38 +557,39 @@ def fetch_rate_limits(access_token):
         _usage_cache["time"] = now
         return result
 
-    def hdr(name):
-        return headers.get(f"anthropic-ratelimit-unified-{name}")
+    if headers is not None:
+        def hdr(name):
+            return headers.get(f"anthropic-ratelimit-unified-{name}")
 
-    try:
-        v = hdr("5h-utilization")
-        result["5h_utilization"] = float(v) if v else None
-    except (TypeError, ValueError):
-        pass
-    try:
-        v = hdr("7d-utilization")
-        result["7d_utilization"] = float(v) if v else None
-    except (TypeError, ValueError):
-        pass
-    result["5h_status"] = hdr("5h-status")
-    result["7d_status"] = hdr("7d-status")
-    try:
-        v = hdr("5h-reset")
-        result["5h_reset"] = int(v) if v else None
-    except (TypeError, ValueError):
-        pass
-    try:
-        v = hdr("7d-reset")
-        result["7d_reset"] = int(v) if v else None
-    except (TypeError, ValueError):
-        pass
-    result["overage_status"] = hdr("overage-status")
-    try:
-        v = hdr("fallback-percentage")
-        result["fallback_pct"] = float(v) if v else None
-    except (TypeError, ValueError):
-        pass
-    result["representative_claim"] = hdr("representative-claim")
+        try:
+            v = hdr("5h-utilization")
+            result["5h_utilization"] = float(v) if v else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            v = hdr("7d-utilization")
+            result["7d_utilization"] = float(v) if v else None
+        except (TypeError, ValueError):
+            pass
+        result["5h_status"] = hdr("5h-status")
+        result["7d_status"] = hdr("7d-status")
+        try:
+            v = hdr("5h-reset")
+            result["5h_reset"] = int(v) if v else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            v = hdr("7d-reset")
+            result["7d_reset"] = int(v) if v else None
+        except (TypeError, ValueError):
+            pass
+        result["overage_status"] = hdr("overage-status")
+        try:
+            v = hdr("fallback-percentage")
+            result["fallback_pct"] = float(v) if v else None
+        except (TypeError, ValueError):
+            pass
+        result["representative_claim"] = hdr("representative-claim")
 
     _usage_cache["value"] = result
     _usage_cache["time"] = now
