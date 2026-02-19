@@ -533,7 +533,7 @@ def fetch_rate_limits(access_token):
     headers = None
     try:
         body = json.dumps({
-            "model": "claude-3-5-haiku-latest",
+            "model": "claude-3-haiku-20240307",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "x"}],
         }).encode()
