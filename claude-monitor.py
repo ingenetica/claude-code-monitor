@@ -15,6 +15,8 @@ import glob
 import signal
 import time
 import shutil
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 
@@ -49,6 +51,32 @@ CLAWD_W = 9  # visible width of the icon
 PURPLE = "\033[38;2;124;58;237m"       # Active – Claude purple (#7C3AED)
 ORANGE = "\033[38;2;215;119;87m"       # Inactive – clawd_body rgb(215,119,87)
 ICON_GREEN = "\033[38;2;74;222;128m"   # Subprocess – green
+
+# Rate limit display
+USAGE_WARN_THRESHOLD = 0.50   # yellow
+USAGE_DANGER_THRESHOLD = 0.80 # red
+USAGE_REFRESH_INTERVAL = 60   # seconds between API calls
+
+BAR_FILLED = "█"
+BAR_EMPTY = "░"
+BAR_WIDTH = 30
+
+PLAN_DISPLAY_NAMES = {
+    "free": "Free",
+    "pro": "Pro ($20/mo)",
+    "max": "Max 5x ($100/mo)",
+    "max_20x": "Max 20x ($200/mo)",
+}
+TIER_DISPLAY_NAMES = {
+    "default_claude_max_5x": "Max 5x",
+    "default_claude_max_20x": "Max 20x",
+    "default_claude_pro": "Pro",
+    "default_claude_free": "Free",
+}
+
+# Caches
+_usage_cache = {"value": None, "time": 0}
+_creds_cache = {"value": None, "time": 0}
 
 
 def get_terminal_size():
@@ -340,7 +368,7 @@ def format_status_text(ago, is_locked):
         return f"{DIM}Waiting ({int(ago / 60)}m){RESET}"
 
 
-def build_output(processes, sessions_info, locked_sessions, results, term_width, term_height):
+def build_output(processes, sessions_info, locked_sessions, results, term_width, term_height, usage_data=None):
     """Build the full display string."""
     buf = []
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -352,6 +380,15 @@ def build_output(processes, sessions_info, locked_sessions, results, term_width,
     buf.append("")
     title = f"  {BOLD}{WHITE}Claude Code Monitor{RESET}  {DIM}{n} instance{'s' if n != 1 else ''}{RESET}  {DIM}{now_str}{RESET}"
     buf.append(title)
+
+    # Plan & usage bars (above instances)
+    if usage_data:
+        buf.append(f"  {DIM}{'─' * (max_w - 2)}{RESET}")
+        plan_lines = build_plan_section(
+            usage_data["creds"], usage_data["rate_limits"], max_w
+        )
+        buf.extend(plan_lines)
+
     buf.append(f"  {DIM}{'─' * (max_w - 2)}{RESET}")
 
     if not processes:
@@ -425,8 +462,247 @@ def build_output(processes, sessions_info, locked_sessions, results, term_width,
     return "\n".join(buf)
 
 
+def get_credentials():
+    """Get Claude credentials from macOS Keychain. Cached for 5 min."""
+    now = time.time()
+    if _creds_cache["value"] is not None and now - _creds_cache["time"] < 300:
+        return _creds_cache["value"]
+
+    creds = None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout.strip())
+            oauth = data.get("claudeAiOauth", {})
+            creds = {
+                "access_token": oauth.get("accessToken"),
+                "subscription_type": oauth.get("subscriptionType", "pro"),
+                "rate_limit_tier": oauth.get("rateLimitTier", ""),
+                "org_id": data.get("claudeAiOauth", {}).get("organizationUuid", ""),
+            }
+    except Exception:
+        pass
+
+    if creds is None:
+        # Fallback: read from statsig
+        plan = "pro"
+        statsig_dir = os.path.join(CLAUDE_DIR, "statsig")
+        try:
+            for f in glob.glob(os.path.join(statsig_dir, "statsig.failed_logs.*")):
+                with open(f, "r") as fh:
+                    data = json.load(fh)
+                entries = data if isinstance(data, list) else [data]
+                for entry in entries:
+                    st = entry.get("user", {}).get("custom", {}).get("subscriptionType")
+                    if st:
+                        plan = st
+                        break
+        except Exception:
+            pass
+        creds = {"access_token": None, "subscription_type": plan, "rate_limit_tier": "", "org_id": ""}
+
+    _creds_cache["value"] = creds
+    _creds_cache["time"] = now
+    return creds
+
+
+def fetch_rate_limits(access_token):
+    """Make a minimal API call to get real rate limit utilization headers. Cached 60s."""
+    now = time.time()
+    if _usage_cache["value"] is not None and now - _usage_cache["time"] < USAGE_REFRESH_INTERVAL:
+        return _usage_cache["value"]
+
+    result = {
+        "5h_utilization": None, "7d_utilization": None,
+        "5h_status": None, "7d_status": None,
+        "5h_reset": None, "7d_reset": None,
+        "overage_status": None, "fallback_pct": None,
+        "representative_claim": None,
+        "error": None,
+    }
+
+    if not access_token:
+        result["error"] = "no token"
+        _usage_cache["value"] = result
+        _usage_cache["time"] = now
+        return result
+
+    try:
+        body = json.dumps({
+            "model": "claude-3-5-haiku-latest",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "x"}],
+        }).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json",
+        })
+        resp = urllib.request.urlopen(req, timeout=10)
+        headers = resp.headers
+    except urllib.error.HTTPError as e:
+        headers = e.headers
+        if e.code == 429:
+            result["error"] = "rate-limited"
+        else:
+            result["error"] = f"HTTP {e.code}"
+    except Exception as ex:
+        result["error"] = str(ex)[:40]
+        _usage_cache["value"] = result
+        _usage_cache["time"] = now
+        return result
+
+    def hdr(name):
+        return headers.get(f"anthropic-ratelimit-unified-{name}")
+
+    try:
+        v = hdr("5h-utilization")
+        result["5h_utilization"] = float(v) if v else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        v = hdr("7d-utilization")
+        result["7d_utilization"] = float(v) if v else None
+    except (TypeError, ValueError):
+        pass
+    result["5h_status"] = hdr("5h-status")
+    result["7d_status"] = hdr("7d-status")
+    try:
+        v = hdr("5h-reset")
+        result["5h_reset"] = int(v) if v else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        v = hdr("7d-reset")
+        result["7d_reset"] = int(v) if v else None
+    except (TypeError, ValueError):
+        pass
+    result["overage_status"] = hdr("overage-status")
+    try:
+        v = hdr("fallback-percentage")
+        result["fallback_pct"] = float(v) if v else None
+    except (TypeError, ValueError):
+        pass
+    result["representative_claim"] = hdr("representative-claim")
+
+    _usage_cache["value"] = result
+    _usage_cache["time"] = now
+    return result
+
+
+def format_reset_time(reset_ts):
+    """Format a unix timestamp as human-readable relative/absolute time."""
+    if not reset_ts:
+        return ""
+    now = time.time()
+    dt = datetime.fromtimestamp(reset_ts)
+    diff = reset_ts - now
+    if diff <= 0:
+        return "now"
+    if diff < 3600:
+        return f"{int(diff / 60)}m"
+    if diff < 86400:
+        return f"{int(diff / 3600)}h {int((diff % 3600) / 60)}m"
+    return dt.strftime("%a %H:%M")
+
+
+def build_usage_bar(utilization, bar_w, label, reset_ts=None, status=None):
+    """Build a single usage bar line."""
+    if utilization is None:
+        return f"  {label}  {DIM}(no data){RESET}"
+
+    ratio = min(utilization, 1.0)
+    pct = int(ratio * 100)
+
+    if ratio >= USAGE_DANGER_THRESHOLD:
+        color = RED
+    elif ratio >= USAGE_WARN_THRESHOLD:
+        color = YELLOW
+    else:
+        color = GREEN
+
+    filled = int(ratio * bar_w)
+    empty = bar_w - filled
+    bar = f"{color}{BAR_FILLED * filled}{RESET}{DIM}{BAR_EMPTY * empty}{RESET}"
+    avail = 100 - pct
+
+    parts = f"  {label}  [{bar}] {color}{pct:>3}%{RESET}  {DIM}{avail}% free{RESET}"
+    if reset_ts:
+        parts += f"  {DIM}Reset: {format_reset_time(reset_ts)}{RESET}"
+    if status and status != "allowed":
+        parts += f"  {RED}{BOLD}● {status}{RESET}"
+    return parts
+
+
+def build_plan_section(creds, rate_limits, max_w):
+    """Build the plan info + usage bars section."""
+    lines = []
+
+    # Plan display name
+    sub = creds.get("subscription_type", "pro")
+    plan_name = PLAN_DISPLAY_NAMES.get(sub, sub.title())
+    tier = creds.get("rate_limit_tier", "")
+    tier_name = TIER_DISPLAY_NAMES.get(tier, "")
+
+    # Status indicator
+    status_5h = rate_limits.get("5h_status")
+    status_7d = rate_limits.get("7d_status")
+    overage = rate_limits.get("overage_status")
+    if status_5h == "allowed" and status_7d == "allowed":
+        status_icon = f"{GREEN}●{RESET}"
+        status_text = f"{GREEN}Allowed{RESET}"
+    elif status_5h == "rate-limited" or status_7d == "rate-limited":
+        status_icon = f"{RED}●{RESET}"
+        status_text = f"{RED}Rate Limited{RESET}"
+    else:
+        status_icon = f"{YELLOW}●{RESET}"
+        status_text = f"{YELLOW}Unknown{RESET}"
+
+    # Header
+    header = f" Plan: {plan_name} "
+    if tier_name and tier_name not in plan_name:
+        header += f"({tier_name}) "
+    dashes = max_w - 4 - len(header) - 12  # leave room for status
+    if dashes < 0:
+        dashes = 0
+    lines.append(f"  {DIM}──{RESET}{BOLD}{WHITE}{header}{RESET}{DIM}{'─' * dashes}{RESET}  {status_icon} {status_text}")
+
+    # Usage bars
+    bar_w = min(BAR_WIDTH, max_w - 40)
+    lines.append(build_usage_bar(
+        rate_limits.get("5h_utilization"), bar_w, f"{CYAN}5h Window{RESET}",
+        rate_limits.get("5h_reset"), status_5h,
+    ))
+    lines.append(build_usage_bar(
+        rate_limits.get("7d_utilization"), bar_w, f"{BLUE}7d Window{RESET}",
+        rate_limits.get("7d_reset"), status_7d,
+    ))
+
+    # Warning lines
+    representative = rate_limits.get("representative_claim")
+    u5 = rate_limits.get("5h_utilization") or 0
+    u7 = rate_limits.get("7d_utilization") or 0
+    peak = max(u5, u7)
+    if peak >= USAGE_DANGER_THRESHOLD:
+        window = "5h" if u5 >= u7 else "7d"
+        lines.append(f"  {RED}{BOLD}⚠ Approaching {window} rate limit – responses may be slower or use fallback models{RESET}")
+    elif overage == "rejected":
+        lines.append(f"  {DIM}Overage: disabled (org policy){RESET}")
+
+    # Error from API
+    err = rate_limits.get("error")
+    if err and rate_limits.get("5h_utilization") is None:
+        lines.append(f"  {DIM}API: {err}{RESET}")
+
+    return lines
+
+
 def collect_data():
-    """Gather all data and return (processes, sessions_info, locked_sessions, results)."""
+    """Gather all data and return (processes, sessions_info, locked_sessions, results, token_data)."""
     processes = get_claude_processes()
     project_dirs = find_project_dirs()
     active_files = get_active_sessions(project_dirs, len(processes))
@@ -456,13 +732,18 @@ def collect_data():
             results[i] = (proc, unmatched_sessions.pop(0))
             matched.add(results[i][1]["session_id"])
 
-    return processes, sessions_info, locked_sessions, results
+    # Rate limit data from API
+    creds = get_credentials()
+    rate_limits = fetch_rate_limits(creds.get("access_token"))
+    usage_data = {"creds": creds, "rate_limits": rate_limits}
+
+    return processes, sessions_info, locked_sessions, results, usage_data
 
 
 def run_once():
-    processes, sessions_info, locked_sessions, results = collect_data()
+    processes, sessions_info, locked_sessions, results, usage_data = collect_data()
     ts = get_terminal_size()
-    output = build_output(processes, sessions_info, locked_sessions, results, ts.columns, ts.lines)
+    output = build_output(processes, sessions_info, locked_sessions, results, ts.columns, ts.lines, usage_data)
     print(output)
 
 
@@ -481,10 +762,10 @@ def run_watch(interval):
 
     try:
         while True:
-            processes, sessions_info, locked_sessions, results = collect_data()
+            processes, sessions_info, locked_sessions, results, usage_data = collect_data()
             ts = get_terminal_size()
             output = build_output(
-                processes, sessions_info, locked_sessions, results, ts.columns, ts.lines
+                processes, sessions_info, locked_sessions, results, ts.columns, ts.lines, usage_data
             )
             sys.stdout.write(CLEAR_SCREEN + output)
             sys.stdout.flush()
