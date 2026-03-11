@@ -801,6 +801,8 @@ def fetch_rate_limits(access_token):
         "5h_utilization": None, "7d_utilization": None,
         "5h_status": None, "7d_status": None,
         "5h_reset": None, "7d_reset": None,
+        "5h_tokens_limit": None, "5h_tokens_remaining": None,
+        "7d_tokens_limit": None, "7d_tokens_remaining": None,
         "overage_status": None, "fallback_pct": None,
         "representative_claim": None,
         "error": None,
@@ -873,6 +875,19 @@ def fetch_rate_limits(access_token):
             pass
         result["representative_claim"] = hdr("representative-claim")
 
+        # Token budget headers (extract if available)
+        for window in ("5h", "7d"):
+            try:
+                v = hdr(f"{window}-tokens-limit")
+                result[f"{window}_tokens_limit"] = int(v) if v else None
+            except (TypeError, ValueError):
+                pass
+            try:
+                v = hdr(f"{window}-tokens-remaining")
+                result[f"{window}_tokens_remaining"] = int(v) if v else None
+            except (TypeError, ValueError):
+                pass
+
     _usage_cache["value"] = result
     _usage_cache["time"] = now
     return result
@@ -895,7 +910,16 @@ def format_reset_time(reset_ts):
     return date_str
 
 
-def build_usage_bar(utilization, bar_w, label, reset_ts=None, status=None):
+def _fmt_tokens(n):
+    """Format token count in compact form."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def build_usage_bar(utilization, bar_w, label, reset_ts=None, status=None, tokens_limit=None, tokens_remaining=None):
     """Build a single usage bar line."""
     if utilization is None:
         return f"  {label}  {DIM}(no data){RESET}"
@@ -913,9 +937,12 @@ def build_usage_bar(utilization, bar_w, label, reset_ts=None, status=None):
     filled = int(ratio * bar_w)
     empty = bar_w - filled
     bar = f"{color}{BAR_FILLED * filled}{RESET}{DIM}{BAR_EMPTY * empty}{RESET}"
-    avail = 100 - pct
 
-    parts = f"  {label}  [{bar}] {color}{pct:>3}%{RESET}  {DIM}{avail}% free{RESET}"
+    if tokens_limit and tokens_remaining is not None:
+        tokens_used = tokens_limit - tokens_remaining
+        parts = f"  {label}  [{bar}] {color}{pct:>3}%{RESET}  {DIM}{_fmt_tokens(tokens_used)}/{_fmt_tokens(tokens_limit)}{RESET}"
+    else:
+        parts = f"  {label}  [{bar}] {color}{pct:>3}%{RESET}"
     if reset_ts:
         parts += f"  {DIM}Reset: {format_reset_time(reset_ts)}{RESET}"
     if status and status != "allowed":
@@ -959,12 +986,14 @@ def build_plan_section(creds, rate_limits, max_w):
     # Usage bars
     bar_w = min(BAR_WIDTH, max_w - 40)
     lines.append(build_usage_bar(
-        rate_limits.get("5h_utilization"), bar_w, f"{CYAN}5h Window{RESET}",
+        rate_limits.get("5h_utilization"), bar_w, f"{CYAN}5h{RESET}",
         rate_limits.get("5h_reset"), status_5h,
+        rate_limits.get("5h_tokens_limit"), rate_limits.get("5h_tokens_remaining"),
     ))
     lines.append(build_usage_bar(
-        rate_limits.get("7d_utilization"), bar_w, f"{BLUE}7d Window{RESET}",
+        rate_limits.get("7d_utilization"), bar_w, f"{BLUE}7d{RESET}",
         rate_limits.get("7d_reset"), status_7d,
+        rate_limits.get("7d_tokens_limit"), rate_limits.get("7d_tokens_remaining"),
     ))
 
     # Warning lines
