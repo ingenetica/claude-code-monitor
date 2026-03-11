@@ -85,6 +85,16 @@ TIER_DISPLAY_NAMES = {
     "default_claude_free": "Free",
 }
 
+# Estimated token budgets per plan (interpolated from public usage data).
+# Sources: community benchmarks ~45 Sonnet msgs/5h for Pro, 5x/20x multipliers.
+# Adjust if your observed usage differs.
+PLAN_TOKEN_BUDGETS = {
+    "free":    {"5h":     50_000, "7d":     500_000},
+    "pro":     {"5h":    450_000, "7d":   6_000_000},
+    "max":     {"5h":  2_250_000, "7d":  30_000_000},
+    "max_20x": {"5h":  9_000_000, "7d": 120_000_000},
+}
+
 # Caches
 _usage_cache = {"value": None, "time": 0}
 _creds_cache = {"value": None, "time": 0}
@@ -983,18 +993,25 @@ def build_plan_section(creds, rate_limits, max_w):
         dashes = 0
     lines.append(f"  {DIM}──{RESET}{BOLD}{WHITE}{header}{RESET}{DIM}{'─' * dashes}{RESET}  {status_icon} {status_text}")
 
-    # Usage bars
+    # Usage bars — use API token headers if available, otherwise interpolate from plan budget
     bar_w = min(BAR_WIDTH, max_w - 40)
-    lines.append(build_usage_bar(
-        rate_limits.get("5h_utilization"), bar_w, f"{CYAN}5h{RESET}",
-        rate_limits.get("5h_reset"), status_5h,
-        rate_limits.get("5h_tokens_limit"), rate_limits.get("5h_tokens_remaining"),
-    ))
-    lines.append(build_usage_bar(
-        rate_limits.get("7d_utilization"), bar_w, f"{BLUE}7d{RESET}",
-        rate_limits.get("7d_reset"), status_7d,
-        rate_limits.get("7d_tokens_limit"), rate_limits.get("7d_tokens_remaining"),
-    ))
+    budgets = PLAN_TOKEN_BUDGETS.get(sub, PLAN_TOKEN_BUDGETS.get("pro"))
+
+    for window, w_color, w_status in [("5h", CYAN, status_5h), ("7d", BLUE, status_7d)]:
+        utilization = rate_limits.get(f"{window}_utilization")
+        tokens_limit = rate_limits.get(f"{window}_tokens_limit")
+        tokens_remaining = rate_limits.get(f"{window}_tokens_remaining")
+
+        # Interpolate from plan budget when API doesn't provide token counts
+        if tokens_limit is None and utilization is not None and budgets:
+            tokens_limit = budgets[window]
+            tokens_remaining = int(tokens_limit * (1 - min(utilization, 1.0)))
+
+        lines.append(build_usage_bar(
+            utilization, bar_w, f"{w_color}{window}{RESET}",
+            rate_limits.get(f"{window}_reset"), w_status,
+            tokens_limit, tokens_remaining,
+        ))
 
     # Warning lines
     representative = rate_limits.get("representative_claim")
